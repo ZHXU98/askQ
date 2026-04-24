@@ -67,7 +67,6 @@ python scripts/fetch_stocks.py --portfolio
 
 - **实时行情**：依赖 `akshare`（`pip install akshare`）
 - **无 akshare 降级**：脚本仍可运行，但只输出静态列表（无实时价格/PE/PB）
-- 详见 `references/data-sources.md`
 
 ---
 
@@ -163,7 +162,7 @@ python scripts/fetch_stocks.py --portfolio
 
 **触发语**：「帮我用龙头战法扫股」「今天有哪些首板」「现在市场什么阶段」「该重仓还是轻仓」「连板龙头是谁」「有没有首阴买点」
 
-详细判断框架 → `references/scenario-f-emotion-cycle.md` | 扫股步骤 → `references/scenario-e-dragon-scan.md`
+详细判断框架 → `references/emotion-cycle.md` | 扫股步骤 → `references/dragon-scan.md`
 
 ```bash
 python3 scripts/scan_dragon.py                 # 全量扫描
@@ -179,7 +178,7 @@ python3 scripts/scan_dragon.py --mode firstyin # 仅首阴买点
 
 **触发语**：「帮我扫ETF」「今天哪些ETF涨了」「ETF怎么选」「沪深300哪个ETF好」「分析我的ETF持仓」「ETF浮盈多少」
 
-扫描步骤 → `references/scenario-g-etf-scan.md` | 选择标准 → `references/scenario-h-etf-selection.md`
+扫描步骤 → `references/etf-scan.md` | 选择标准 → `references/etf-selection.md`
 
 ```bash
 python3 scripts/scan_etf.py --mode core       # 核心ETF监控
@@ -232,13 +231,15 @@ python3 scripts/scan_etf.py --mode portfolio  # 我的持仓分析
 - `scripts/scan_dragon.py` — **龙头战法量化扫股脚本**（涨停板池/首板/连板/首阴）
 - `my_portfolio.json` — 用户自选股配置
 - `references/nga-dragon-method.md` — **NGA 龙头战法完整手册**
+- `references/dragon-scan.md` — 场景E：龙头扫股详细步骤
+- `references/emotion-cycle.md` — 场景E：情绪周期判断框架
 
 **ETF 相关**
 - `scripts/scan_etf.py` — **ETF 行情扫描脚本**（涨跌榜/动量/超跌/持仓/估值）
 - `my_etf_portfolio.json` — 用户 ETF 持仓配置
 - `references/etf-trading.md` — **ETF 交易完整手册**（策略/选品/择时/仓位）
-- `references/scenario-g-etf-scan.md` — 场景G：ETF行情扫描详细步骤与分析模板
-- `references/scenario-h-etf-selection.md` — 场景H：ETF选择与对比标准
+- `references/etf-scan.md` — 场景F：ETF行情扫描详细步骤与分析模板
+- `references/etf-selection.md` — 场景F：ETF选择与对比标准
 
 **示例**
 - `examples/stock-analysis-example.md` — 完整分析示例
