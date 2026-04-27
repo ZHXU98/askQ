@@ -174,27 +174,69 @@ python3 scripts/scan_dragon.py --mode firstyin # 仅首阴买点
 
 ---
 
-### 场景 F：ETF 分析（扫描 / 选择 / 持仓）
+### 场景 F：ETF 行情扫描（涨跌榜/动量/超跌）
 
-**触发语**：「帮我扫ETF」「今天哪些ETF涨了」「ETF怎么选」「沪深300哪个ETF好」「分析我的ETF持仓」「ETF浮盈多少」
+**触发语**：「帮我扫ETF」「今天哪些ETF涨了」「最强势的ETF是哪个」「有没有超跌的ETF」
 
-扫描步骤 → `references/etf-scan.md` | 选择标准 → `references/etf-selection.md`
+扫描步骤 → `references/etf-scan.md`
 
 ```bash
-python3 scripts/scan_etf.py --mode core       # 核心ETF监控
-python3 scripts/scan_etf.py --mode rank       # 今日涨跌榜
-python3 scripts/scan_etf.py --mode momentum   # 近20日动量
-python3 scripts/scan_etf.py --mode oversold   # 超跌筛选
-python3 scripts/scan_etf.py --mode valuation  # 估值参考
-python3 scripts/scan_etf.py --mode portfolio  # 我的持仓分析
+# 今日涨跌幅排行（最常用）
+python3 scripts/scan_etf.py --mode rank
+
+# 核心 ETF 行情监控（宽基+主要行业）
+python3 scripts/scan_etf.py --mode core
+
+# 近20日动量筛选（趋势追踪）
+python3 scripts/scan_etf.py --mode momentum
+
+# 超跌筛选（从高点回撤≥25%）
+python3 scripts/scan_etf.py --mode oversold
+
+# 宽基指数估值参考（择时辅助）
+python3 scripts/scan_etf.py --mode valuation
+```
+
+---
+
+### 场景 G：我的ETF持仓分析
+
+**触发语**：「分析我的ETF持仓」「我的ETF浮盈多少」「看看我的ETF仓位」
+
+持仓文件：`my_etf_portfolio.json`
+
+```bash
+# ETF持仓报告（含浮盈计算）
+python3 scripts/scan_etf.py --mode portfolio
+
+# ETF份额变动快报（一级市场申购/赎回信号）
+python3 scripts/scan_etf.py --mode share_flow
 ```
 
 回答时结合 `references/etf-trading.md`：
-- **扫描/推荐**：定投倍数(2.1节)、超跌低吸(2.3节)、行业轮动(2.2节)、PE分位(第四章)
-- **选品对比**：规模 > 跟踪误差 > 费率 > 折溢价接近0（第三章）
-- **持仓建议**：浮盈>20%参考止盈策略(第六章)、浮亏>15%参考补仓条件(第五章)、集中度风险(第七章)
+- **浮盈>20%**：参考止盈策略(第六章)
+- **浮亏>15%**：参考补仓条件(第五章)
+- **集中度风险**：单只ETF占比>30%时提示(第七章)
 
-编辑持仓 → `my_etf_portfolio.json`
+---
+
+### 场景 H：全市场ETF资金流向
+
+**触发语**：「ETF资金流向怎么样」「哪些ETF资金流入最多」「全市场ETF今天怎么样」
+
+```bash
+# 全市场ETF资金流向（主力净流入/流出排名）
+python3 scripts/scan_etf.py --mode market_flow
+
+# JSON格式输出（供程序化处理）
+python3 scripts/scan_etf.py --mode market_flow --json
+```
+
+**输出内容**：
+- 💰 **主力净流入TOP 10** - 今日资金最追捧的ETF
+- 💸 **主力净流出TOP 10** - 今日资金撤离的ETF
+- 🔥 **成交额TOP 10** - 二级市场最活跃的ETF
+- 📊 **分类汇总** - 宽基/行业/跨境等各类ETF整体流向
 
 ---
 
@@ -235,11 +277,19 @@ python3 scripts/scan_etf.py --mode portfolio  # 我的持仓分析
 - `references/emotion-cycle.md` — 场景E：情绪周期判断框架
 
 **ETF 相关**
-- `scripts/scan_etf.py` — **ETF 行情扫描脚本**（涨跌榜/动量/超跌/持仓/估值）
+- `scripts/scan_etf.py` — **ETF 综合分析脚本**
+  - `--mode rank`: 涨跌榜
+  - `--mode momentum`: 动量筛选
+  - `--mode oversold`: 超跌筛选
+  - `--mode core`: 核心ETF监控
+  - `--mode valuation`: 估值参考
+  - `--mode portfolio`: 我的持仓分析
+  - `--mode share_flow`: 持仓份额变动（一级市场）
+  - `--mode market_flow`: 全市场资金流向
 - `my_etf_portfolio.json` — 用户 ETF 持仓配置
 - `references/etf-trading.md` — **ETF 交易完整手册**（策略/选品/择时/仓位）
-- `references/etf-scan.md` — 场景F：ETF行情扫描详细步骤与分析模板
-- `references/etf-selection.md` — 场景F：ETF选择与对比标准
+- `references/etf-scan.md` — ETF行情扫描详细步骤与分析模板
+- `references/etf-selection.md` — ETF选择与对比标准
 
 **示例**
 - `examples/stock-analysis-example.md` — 完整分析示例

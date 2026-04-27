@@ -91,7 +91,9 @@ pip install akshare pandas
 | C 个股分析 | 「分析茅台」 | — |
 | D 选股策略 | 「给我选股思路」 | — |
 | E 龙头战法 | 「今天首板」「市场情绪」 | `python scripts/scan_dragon.py` |
-| F ETF 分析 | 「帮我扫ETF」「ETF浮盈」 | `python scripts/scan_etf.py --mode portfolio` |
+| F ETF 扫描 | 「帮我扫ETF」「今天ETF涨跌」 | `python scripts/scan_etf.py --mode rank` |
+| G ETF 持仓 | 「我的ETF浮盈」「分析我的ETF持仓」 | `python scripts/scan_etf.py --mode portfolio` |
+| H ETF 资金流向 | 「ETF资金流向」「哪些ETF资金流入」 | `python scripts/scan_etf.py --mode market_flow` |
 
 ---
 

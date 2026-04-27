@@ -9,6 +9,7 @@ scan_etf.py — ETF 行情扫描与分析脚本
 4. 【核心 ETF 监控】预设核心宽基/行业 ETF 的实时行情汇总
 5. 【用户 ETF 持仓】读取 my_etf_portfolio.json，输出含成本的持仓报告
 6. 【估值参考】主要宽基指数 PE/PB 历史分位（辅助择时）
+7. 【资金流向】ETF 一级市场份额变化 + 全市场资金流向分类排行
 
 依赖：pip install akshare pandas
 
@@ -20,15 +21,25 @@ scan_etf.py — ETF 行情扫描与分析脚本
   python3 scripts/scan_etf.py --mode core        # 核心ETF监控
   python3 scripts/scan_etf.py --mode portfolio   # 我的ETF持仓
   python3 scripts/scan_etf.py --mode valuation   # 估值参考
+  python3 scripts/scan_etf.py --mode flow        # 资金流向（份额变化+全市场分类）
   python3 scripts/scan_etf.py --json             # JSON格式输出
 """
 
 import json
 import sys
 import argparse
+import time
+import functools
 from datetime import datetime, timedelta, time
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 
 try:
     import akshare as ak
@@ -106,6 +117,42 @@ def _fmt_amount(v: Optional[float]) -> str:
     if abs(v) >= 1e8:
         return f"{v/1e8:.2f}亿"
     return f"{v/1e4:.0f}万"
+
+
+# ──────────────────────────────────────────────
+# 网络请求重试装饰器
+# ──────────────────────────────────────────────
+
+def retry_on_failure(max_retries: int = 3, delay: float = 2.0, backoff: float = 2.0):
+    """
+    网络请求重试装饰器（指数退避）
+    
+    Args:
+        max_retries: 最大重试次数
+        delay: 初始延迟时间（秒）
+        backoff: 退避倍数
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            retry_delay = delay
+            last_exception = None
+            
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        print(f"⚠️  第{attempt + 1}次尝试失败: {str(e)[:50]}")
+                        print(f"   等待 {retry_delay:.1f} 秒后重试...")
+                        time.sleep(retry_delay)
+                        retry_delay *= backoff
+            
+            # 所有重试都失败
+            raise last_exception
+        return wrapper
+    return decorator
 
 
 # ──────────────────────────────────────────────
@@ -684,6 +731,684 @@ def get_valuation_reference() -> List[Dict]:
 
 
 # ──────────────────────────────────────────────
+# 8. 资金流向（一级市场份额变化 + 全市场分类流向）
+# ──────────────────────────────────────────────
+
+# ETF 分类关键字映射（用于全市场 ETF 自动分类）
+# 注意：关键词按优先级排序，优先匹配更具体的行业/主题
+ETF_CATEGORY_KEYWORDS = {
+    # 宽基指数（优先级最高）
+    "宽基": ["沪深300", "中证500", "中证1000", "上证50", "创业板", "科创", "A500", "A50",
+             "中证800", "中证200", "上证180", "深证100", "全指"],
+    
+    # 行业主题（按活跃度排序）
+    "科技": ["半导体", "芯片", "人工智能", "AI", "信息技术", "软件", "云计算", "数字",
+             "通信", "5G", "互联网", "大数据", "机器人", "工业40", "工业4.0"],
+    
+    "新能源": ["新能源", "光伏", "风电", "储能", "电动车", "锂电", "绿电", "碳中和",
+               "清洁能源", "新能源车"],
+    
+    "医药": ["医药", "医疗", "生物", "创新药", "医械", "CXO", "医美", "疫苗"],
+    
+    "消费": ["消费", "白酒", "食品", "家电", "零售", "品牌", "必选", "可选"],
+    
+    "金融": ["银行", "券商", "保险", "金融", "地产", "房地产", "证券"],
+    
+    "资源": ["黄金", "原油", "能源", "煤炭", "有色", "钢铁", "化工", "采矿",
+             "资源", "石油", "天然气"],
+    
+    "红利": ["红利", "高股息", "股息", "分红", "现金流"],
+    
+    "国企改革": ["国企改革", "国企", "一带一路"],
+    
+    "环保": ["环保", "环境治理", "环境", "低碳"],
+    
+    # 跨境投资
+    "港股": ["港股", "恒生", "恒科", "恒指", "H股", "南向"],
+    
+    "海外": ["纳斯达克", "标普", "纳指", "美股", "日经", "德国", "欧洲",
+             "印度", "越南", "东南亚", "QDII", "境外"],
+    
+    # 其他资产类别
+    "债券": ["债券", "国债", "企债", "可转债", "利率"],
+    
+    "商品": ["黄金", "白银", "铜", "铝", "商品"],
+    
+    # LOF常见主题（需要具体分类的放前面）
+    "社会责任": ["社会责任", "ESG", "可持续发展"],
+    
+    "主题投资": ["创新", "成长", "领先", "先锋", "主题", "未来"],
+}
+
+def _classify_etf(name: str) -> str:
+    """根据ETF名称自动分类"""
+    for cat, keywords in ETF_CATEGORY_KEYWORDS.items():
+        for kw in keywords:
+            if kw in name:
+                return cat
+    return "其他"
+
+
+def get_portfolio_share_flow(days: int = 10) -> List[Dict]:
+    """
+    获取持仓ETF近N日一级市场份额变化（申购/赎回信号）。
+    通过 fund_etf_fund_info_em 获取历史净值+份额数据，
+    计算最近 days 天的份额净变化趋势。
+    """
+    if not HAS_AKSHARE:
+        return []
+
+    holdings = load_etf_portfolio()
+    if not holdings:
+        return []
+
+    # 一次性获取全市场ETF数据（避免在循环中重复获取）
+    spot_df_all = None
+    try:
+        spot_df_all = ak.fund_etf_spot_em()
+    except Exception:
+        pass  # 如果获取失败，后续份额数据会是 N/A
+
+    results = []
+    for h in holdings:
+        code = str(h.get("code", ""))
+        name = h.get("name", code)
+        cost = _safe_float(h.get("cost_price"))
+        shares_held = _safe_float(h.get("shares"))
+
+        try:
+            df = ak.fund_etf_fund_info_em(fund=code)
+            if df is None or df.empty:
+                raise ValueError("无数据")
+
+            # 确保列存在
+            df = df.copy()
+            df["净值日期"] = pd.to_datetime(df["净值日期"], errors="coerce")
+            df = df.dropna(subset=["净值日期"]).sort_values("净值日期")
+
+            # 份额列：可能叫"累计份额净值"或"申购"等，实际上 fund_etf_fund_info_em 返回的是净值历史
+            # 用"单位净值"来代理：若总市值字段不可用，改用实时行情的最新份额做截面对比
+            df["单位净值"] = pd.to_numeric(df["单位净值"], errors="coerce")
+
+            # 取最近 days+2 条数据
+            recent = df.tail(days + 2)
+            nav_list = recent["单位净值"].dropna().tolist()
+            date_list = [str(d)[:10] for d in recent["净值日期"].tolist()]
+
+            # 用 fund_etf_spot_em 补充今日最新份额（截面）
+            spot_shares = None
+            spot_mkt_val = None
+            if spot_df_all is not None:
+                row = spot_df_all[spot_df_all["代码"] == code]
+                if not row.empty:
+                    spot_shares = _safe_float(row.iloc[0].get("最新份额"))
+                    spot_mkt_val = _safe_float(row.iloc[0].get("流通市值"))
+
+            # 近期净值变化幅度（代理份额估算）
+            nav_change_7d = None
+            if len(nav_list) >= 8:
+                nav_change_7d = (nav_list[-1] - nav_list[-8]) / nav_list[-8] * 100 if nav_list[-8] > 0 else None
+
+            # 最新净值
+            current_nav = nav_list[-1] if nav_list else None
+            latest_date = date_list[-1] if date_list else ""
+
+            # 浮盈
+            profit_pct = (current_nav - cost) / cost * 100 if current_nav and cost and cost > 0 else None
+            profit_amt = (current_nav - cost) * shares_held if current_nav and cost and shares_held else None
+
+            # 份额信号
+            share_signal = "⚪"
+            share_note = "无份额数据"
+            if spot_shares is not None:
+                share_note = f"当前份额: {spot_shares/1e8:.2f}亿份"
+                share_signal = "⚪"
+
+            results.append({
+                "code":          code,
+                "name":          name,
+                "current_nav":   round(current_nav, 4) if current_nav else None,
+                "latest_date":   latest_date,
+                "nav_change_7d": round(nav_change_7d, 2) if nav_change_7d is not None else None,
+                "spot_shares":   spot_shares,
+                "spot_mkt_val":  spot_mkt_val,
+                "cost":          cost,
+                "profit_pct":    round(profit_pct, 2) if profit_pct is not None else None,
+                "profit_amt":    round(profit_amt, 2) if profit_amt is not None else None,
+                "share_signal":  share_signal,
+                "share_note":    share_note,
+            })
+
+        except Exception as e:
+            results.append({
+                "code":         code,
+                "name":         name,
+                "current_nav":  None,
+                "latest_date":  "",
+                "nav_change_7d": None,
+                "spot_shares":  None,
+                "spot_mkt_val": None,
+                "cost":         cost,
+                "profit_pct":   None,
+                "profit_amt":   None,
+                "share_signal": "⚪",
+                "share_note":   f"数据获取失败: {str(e)[:40]}",
+            })
+
+    return results
+
+
+def _get_column_value(row: pd.Series, possible_names: List[str]) -> Optional[float]:
+    """
+    动态检测列名，兼容不同数据源的列名变体
+    
+    Args:
+        row: pandas Series 数据行
+        possible_names: 可能的列名列表（按优先级排序）
+    
+    Returns:
+        找到的第一个非空值，如果都没找到则返回 None
+    """
+    for name in possible_names:
+        if name in row.index:
+            val = _safe_float(row.get(name))
+            if val is not None:
+                return val
+    return None
+
+
+def _try_akshare_flow(top_n: int = 10) -> Dict:
+    """
+    尝试从 AkShare 获取 ETF 资金流向数据（带重试机制）
+    
+    Returns:
+        成功返回 {"success": True, "data": {...}}
+        失败返回 {"success": False, "error": "..."}
+    """
+    if not HAS_AKSHARE:
+        return {"success": False, "error": "AkShare 未安装"}
+    
+    try:
+        print("⏳ 正在通过 AkShare 获取 ETF 行情数据...")
+        df = ak.fund_etf_spot_em()
+        
+        if df is None or df.empty:
+            return {"success": False, "error": "AkShare 返回空数据"}
+        
+        # 动态检测列名（兼容不同版本）
+        flow_col_options = ["主力净流入净额", "净流入", "主力净流入", "净额"]
+        flow_pct_col_options = ["主力净流入净占比", "净流入占比", "净占比"]
+        share_col_options = ["最新份额", "基金份额", "份额", "总份额"]
+        mktval_col_options = ["流通市值", "基金市值", "市值", "总市值"]
+        price_col_options = ["最新价", "收盘价", "现价", "价格"]
+        change_col_options = ["涨跌幅", "涨幅", "涨跌"]
+        amount_col_options = ["成交额", "成交金额", "成交总量"]
+        
+        # 清洗数值列
+        for col_options in [flow_col_options, flow_pct_col_options, share_col_options, 
+                            mktval_col_options, change_col_options, amount_col_options]:
+            for col in col_options:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+        
+        df = df.dropna(subset=["代码", "名称"])
+        
+        # ── 1. 主力净流入 TOP
+        flow_col = None
+        for col in flow_col_options:
+            if col in df.columns:
+                flow_col = col
+                break
+        
+        top_inflow = []
+        top_outflow = []
+        
+        if flow_col:
+            df_flow = df.dropna(subset=[flow_col])
+            if not df_flow.empty:
+                # 准备输出列
+                output_cols = ["代码", "名称"]
+                for col in price_col_options:
+                    if col in df.columns:
+                        output_cols.append(col)
+                        break
+                for col in change_col_options:
+                    if col in df.columns:
+                        output_cols.append(col)
+                        break
+                output_cols.extend([flow_col])
+                for col in flow_pct_col_options:
+                    if col in df.columns:
+                        output_cols.append(col)
+                        break
+                for col in amount_col_options:
+                    if col in df.columns:
+                        output_cols.append(col)
+                        break
+                
+                top_inflow = df_flow.nlargest(top_n, flow_col)[output_cols].to_dict("records")
+                top_outflow = df_flow.nsmallest(top_n, flow_col)[output_cols].to_dict("records")
+        
+        # ── 2. 按类别汇总主力净流入
+        category_flow = {}
+        for _, row in df.iterrows():
+            name = str(row.get("名称", ""))
+            cat = _classify_etf(name)
+            
+            # 动态获取资金流向值
+            flow = _get_column_value(row, flow_col_options) or 0.0
+            mkt_val = _get_column_value(row, mktval_col_options) or 0.0
+            
+            if cat not in category_flow:
+                category_flow[cat] = {"inflow": 0.0, "count": 0, "mkt_val": 0.0}
+            category_flow[cat]["inflow"] += flow
+            category_flow[cat]["count"] += 1
+            category_flow[cat]["mkt_val"] += mkt_val
+        
+        # 排序：主力净流入从大到小
+        category_flow_sorted = sorted(
+            [{"category": k, **v} for k, v in category_flow.items()],
+            key=lambda x: -x["inflow"]
+        )
+        
+        # ── 3. 流通市值 TOP
+        mktval_col = None
+        for col in mktval_col_options:
+            if col in df.columns:
+                mktval_col = col
+                break
+        
+        share_col = None
+        for col in share_col_options:
+            if col in df.columns:
+                share_col = col
+                break
+        
+        top_by_mktval = []
+        if mktval_col and share_col:
+            df_share = df.dropna(subset=[mktval_col, share_col])
+            if not df_share.empty:
+                output_cols = ["代码", "名称", mktval_col, share_col]
+                for col in price_col_options:
+                    if col in df.columns:
+                        output_cols.append(col)
+                        break
+                for col in change_col_options:
+                    if col in df.columns:
+                        output_cols.append(col)
+                        break
+                if flow_col:
+                    output_cols.append(flow_col)
+                
+                top_by_mktval = df_share.nlargest(top_n, mktval_col)[output_cols].to_dict("records")
+        
+        # ── 4. 今日成交额 TOP
+        amount_col = None
+        for col in amount_col_options:
+            if col in df.columns:
+                amount_col = col
+                break
+        
+        top_by_amount = []
+        if amount_col:
+            df_vol = df.dropna(subset=[amount_col])
+            if not df_vol.empty:
+                output_cols = ["代码", "名称", amount_col]
+                for col in price_col_options:
+                    if col in df.columns:
+                        output_cols.append(col)
+                        break
+                for col in change_col_options:
+                    if col in df.columns:
+                        output_cols.append(col)
+                        break
+                if flow_col:
+                    output_cols.append(flow_col)
+                
+                top_by_amount = df_vol.nlargest(top_n, amount_col)[output_cols].to_dict("records")
+        
+        # ── 汇总统计
+        total_inflow = df[flow_col].sum() if flow_col and flow_col in df.columns else 0
+        total_etf_count = len(df)
+        inflow_count = int((df[flow_col] > 0).sum()) if flow_col and flow_col in df.columns else 0
+        outflow_count = int((df[flow_col] < 0).sum()) if flow_col and flow_col in df.columns else 0
+        
+        return {
+            "success": True,
+            "data": {
+                "summary": {
+                    "total_etf_count":  total_etf_count,
+                    "total_inflow":     round(total_inflow, 0) if total_inflow else 0,
+                    "inflow_count":     inflow_count,
+                    "outflow_count":    outflow_count,
+                },
+                "top_inflow":          top_inflow,
+                "top_outflow":         top_outflow,
+                "category_flow":       category_flow_sorted,
+                "top_by_mktval":       top_by_mktval,
+                "top_by_amount":       top_by_amount,
+            }
+        }
+    
+    except Exception as e:
+        return {"success": False, "error": f"AkShare 接口调用失败: {str(e)}"}
+
+
+def _scrape_eastmoney_flow(top_n: int = 10, min_total: int = 1000) -> Dict:
+    """
+    从东方财富API获取 ETF 资金流向数据（备选方案）
+    
+    数据源: 东方财富HTTP API
+    关键发现：按fid=f62（主力净流入）排序时，API返回完整的资金流向数据
+    
+    Args:
+        top_n: 每个TOP榜单的数量
+        min_total: 最小获取总数（使用分页机制）
+    
+    Returns:
+        成功返回 {"success": True, "data": {...}}
+        失败返回 {"success": False, "error": "..."}
+    """
+    if not HAS_REQUESTS:
+        return {"success": False, "error": "requests 库未安装，无法执行API请求"}
+    
+    # 东方财富ETF资金流向API（按主力净流入排序）
+    url = "http://push2.eastmoney.com/api/qt/clist/get"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Referer": "http://quote.eastmoney.com/",
+        "Accept": "*/*",
+    }
+    
+    # 分页获取数据，直到达到min_total
+    all_etf_data = []
+    page_num = 1
+    page_size = 200  # 每页200条
+    
+    print(f"⏳ 正在通过东方财富API获取 ETF 资金流向数据（目标≥{min_total}条）...")
+    
+    try:
+        while len(all_etf_data) < min_total:
+            params = {
+                "pn": page_num,
+                "pz": page_size,
+                "po": 1,
+                "np": 1,
+                "fltt": 2,
+                "invt": 2,
+                "fid": "f62",  # ✅ 关键：按主力净流入排序
+                "fs": "b:MK0404",  # ETF分类
+                "fields": "f1,f2,f3,f4,f5,f6,f7,f12,f13,f14,f15,f16,f17,f18,f62,f63,f64,f65,f66,f67,f68,f69,f70,f71,f72"
+            }
+            
+            response = requests.get(url, params=params, headers=headers, timeout=30)
+            
+            if response.status_code != 200:
+                break  # 停止分页
+            
+            data = response.json()
+            
+            if data.get("data") is None or data["data"].get("diff") is None:
+                break  # 没有更多数据
+            
+            # 解析当前页数据
+            etf_list = data["data"]["diff"]
+            
+            for item in etf_list:
+                try:
+                    all_etf_data.append({
+                        "代码": str(item.get("f12", "")),
+                        "名称": str(item.get("f14", "")),
+                        "最新价": _safe_float(item.get("f2")),
+                        "涨跌幅": _safe_float(item.get("f3")),
+                        "涨跌额": _safe_float(item.get("f4")),
+                        "成交量": _safe_float(item.get("f5")),
+                        "成交额": _safe_float(item.get("f6")),
+                        "振幅": _safe_float(item.get("f7")),
+                        "最高": _safe_float(item.get("f15")),
+                        "最低": _safe_float(item.get("f16")),
+                        "今开": _safe_float(item.get("f17")),
+                        "昨收": _safe_float(item.get("f18")),
+                        # ✅ 关键资金流向字段
+                        "主力净流入净额": _safe_float(item.get("f62")),  # 主力净流入（元）
+                        "主力净流入占比": _safe_float(item.get("f67")),  # 主力净流入占比（%）
+                    })
+                except:
+                    continue
+            
+            # 如果返回数据少于page_size，说明已到最后一页
+            if len(etf_list) < page_size:
+                break
+            
+            page_num += 1
+        
+        if not all_etf_data:
+            return {"success": False, "error": "解析数据失败，未提取到有效数据"}
+        
+        print(f"✅ 成功获取 {len(all_etf_data)} 只ETF数据")
+        
+        # 转换为DataFrame处理
+        df = pd.DataFrame(all_etf_data)
+        
+        # 按主力净流入排序
+        df_sorted = df.sort_values("主力净流入净额", ascending=False)
+        
+        # 分类汇总（删除mkt_val字段，API不返回）
+        category_flow = {}
+        for _, row in df.iterrows():
+            name = str(row.get("名称", ""))
+            cat = _classify_etf(name)
+            
+            flow = _safe_float(row.get("主力净流入净额")) or 0.0
+            
+            if cat not in category_flow:
+                category_flow[cat] = {"inflow": 0.0, "count": 0}
+            category_flow[cat]["inflow"] += flow
+            category_flow[cat]["count"] += 1
+        
+        # 排序：主力净流入从大到小
+        category_flow_sorted = sorted(
+            [{"category": k, **v} for k, v in category_flow.items()],
+            key=lambda x: -x["inflow"]
+        )
+        
+        # 计算净流入ETF数量
+        inflow_count = int((df["主力净流入净额"] > 0).sum()) if "主力净流入净额" in df.columns else 0
+        outflow_count = int((df["主力净流入净额"] < 0).sum()) if "主力净流入净额" in df.columns else 0
+        total_inflow = df["主力净流入净额"].sum() if "主力净流入净额" in df.columns else 0
+        
+        # 构建返回结构
+        return {
+            "success": True,
+            "data": {
+                "summary": {
+                    "total_etf_count": len(df),
+                    "total_inflow": round(total_inflow, 0) if total_inflow else 0,
+                    "inflow_count": inflow_count,
+                    "outflow_count": outflow_count,
+                },
+                "top_inflow": df_sorted.head(top_n).to_dict("records"),
+                "top_outflow": df_sorted.tail(top_n).to_dict("records"),
+                "category_flow": category_flow_sorted,
+                "top_by_mktval": [],  # API不包含市值数据
+                "top_by_amount": df.sort_values("成交额", ascending=False).head(top_n).to_dict("records"),
+                "data_source": "eastmoney_http_api",
+            }
+        }
+    
+    except requests.Timeout:
+        return {"success": False, "error": "API请求超时（30秒）"}
+    except requests.RequestException as e:
+        return {"success": False, "error": f"网络请求失败: {str(e)}"}
+    except Exception as e:
+        return {"success": False, "error": f"数据解析失败: {str(e)}"}
+
+
+def get_market_etf_flow(top_n: int = 10) -> Dict:
+    """
+    获取全市场 ETF 资金流向（双重数据源保障）
+    
+    优先使用 AkShare 接口，失败后降级到网页抓取
+    
+    返回结构：
+    {
+        "summary": {
+            "total_etf_count": int,
+            "total_inflow": float,
+            "inflow_count": int,
+            "outflow_count": int
+        },
+        "top_inflow": [...],      # 净流入TOP N
+        "top_outflow": [...],     # 净流出TOP N
+        "category_flow": [...],   # 按类别汇总
+        "top_by_mktval": [...],   # 市值最大TOP N
+        "top_by_amount": [...],   # 成交额最大TOP N
+        "data_source": str        # 数据来源标识
+    }
+    """
+    # 尝试 AkShare 接口
+    result = _try_akshare_flow(top_n)
+    
+    if result.get("success"):
+        data = result["data"]
+        data["data_source"] = "akshare_api"
+        return data
+    
+    # AkShare 失败，尝试网页抓取
+    print(f"⚠️  AkShare 失败: {result.get('error')}")
+    print("🔄 尝试备选方案：网页抓取...")
+    
+    result = _scrape_eastmoney_flow(top_n)
+    
+    if result.get("success"):
+        data = result["data"]
+        data["data_source"] = "eastmoney_web_scraping"
+        return data
+    
+    # 所有方案都失败
+    print(f"❌ 网页抓取失败: {result.get('error')}")
+    return {"error": f"所有数据源均失败。AkShare: {result.get('error')}"}
+
+
+
+def print_portfolio_share_flow(flow_list: List[Dict]):
+    """打印持仓ETF份额变化报告"""
+    print("\n📦 我的持仓 ETF — 一级市场份额快报")
+    print("=" * 68)
+    if not flow_list:
+        print("  持仓为空，请先配置 my_etf_portfolio.json")
+        return
+
+    for f in flow_list:
+        code       = f.get("code", "")
+        name       = f.get("name", "")
+        nav        = f.get("current_nav")
+        nav_str    = f"{nav:.4f}" if nav else "N/A"
+        date       = f.get("latest_date", "")
+        nav_7d     = f.get("nav_change_7d")
+        nav_7d_s   = f"{nav_7d:+.2f}%" if nav_7d is not None else "N/A"
+        shares     = f.get("spot_shares")
+        mkt_val    = f.get("spot_mkt_val")
+        shares_s   = f"{shares/1e8:.2f}亿份" if shares else "N/A"
+        mkt_val_s  = f"{mkt_val/1e8:.2f}亿" if mkt_val else "N/A"
+        profit_pct = f.get("profit_pct")
+        profit_amt = f.get("profit_amt")
+        p_str      = f"{profit_pct:+.2f}%" if profit_pct is not None else "N/A"
+        a_str      = f"{profit_amt:+.0f}元" if profit_amt is not None else ""
+
+        sig = "🟢" if (profit_pct or 0) > 0 else ("🔴" if (profit_pct or 0) < 0 else "⚪")
+        print(f"  {sig} [{code}] {name}")
+        print(f"       净值: {nav_str} ({date})  近7日净值: {nav_7d_s}")
+        print(f"       基金总份额: {shares_s}  流通市值: {mkt_val_s}")
+        print(f"       我的浮盈: {p_str} {a_str}")
+        print()
+
+
+def print_market_etf_flow(flow: Dict):
+    """打印全市场ETF资金流向报告"""
+    if not flow or "error" in flow:
+        print(f"\n❌ 全市场资金流向获取失败: {flow.get('error','')}")
+        return
+
+    summary = flow.get("summary", {})
+    print("\n🌊 全市场 ETF 资金流向")
+    print("=" * 68)
+    total_inflow = summary.get("total_inflow", 0)
+    total_str = _fmt_amount(total_inflow) if total_inflow else "N/A"
+    inflow_c = summary.get("inflow_count", 0)
+    outflow_c = summary.get("outflow_count", 0)
+    total_c = summary.get("total_etf_count", 0)
+    trend = "📈 净流入" if total_inflow > 0 else "📉 净流出"
+    print(f"  {trend}  全市场主力净额: {total_str}  共{total_c}只ETF")
+    print(f"  流入ETF: {inflow_c}只  |  流出ETF: {outflow_c}只\n")
+
+    # ── 分类流向（删除规模字段显示）
+    cat_flow = flow.get("category_flow", [])
+    if cat_flow:
+        print("  📊 各类ETF主力净流向排行")
+        print("  " + "-" * 50)
+        for i, c in enumerate(cat_flow[:12], 1):
+            cat = c.get("category", "")
+            inflow = c.get("inflow", 0)
+            count  = c.get("count", 0)
+            flow_str = _fmt_amount(inflow)
+            arrow = "▲" if inflow > 0 else "▼"
+            bar_len = min(int(abs(inflow) / 1e7), 15) if inflow else 0
+            bar = ("█" if inflow > 0 else "░") * bar_len
+            print(f"  {i:2d}. {cat:<6}  {arrow} {flow_str:<10}  {count}只  {bar}")
+        print()
+
+    # ── 主力净流入 TOP
+    top_in = flow.get("top_inflow", [])
+    if top_in:
+        print("  💰 主力净流入 TOP 10")
+        print("  " + "-" * 60)
+        for i, e in enumerate(top_in, 1):
+            code = str(e.get("代码", ""))
+            name = str(e.get("名称", ""))[:12]
+            price = e.get("最新价")
+            pct   = e.get("涨跌幅")
+            inflow = e.get("主力净流入净额")
+            pct_s  = f"{pct:+.2f}%" if pct is not None else "N/A"
+            flow_s = _fmt_amount(inflow) if inflow else "N/A"
+            print(f"  {i:2d}. [{code}]{name:<12}  {pct_s:<8}  净流入: {flow_s}")
+        print()
+
+    # ── 主力净流出 TOP（仅当存在负值数据时显示）
+    top_out = flow.get("top_outflow", [])
+    if outflow_c > 0 and top_out:
+        print("  💸 主力净流出 TOP 10")
+        print("  " + "-" * 60)
+        for i, e in enumerate(top_out, 1):
+            code = str(e.get("代码", ""))
+            name = str(e.get("名称", ""))[:12]
+            pct   = e.get("涨跌幅")
+            outflow = e.get("主力净流入净额")
+            pct_s  = f"{pct:+.2f}%" if pct is not None else "N/A"
+            flow_s = _fmt_amount(abs(outflow)) if outflow and outflow < 0 else "N/A"
+            print(f"  {i:2d}. [{code}]{name:<12}  {pct_s:<8}  净流出: {flow_s}")
+        print()
+    elif outflow_c == 0:
+        print("  ℹ️  今日暂无主力净流出数据（仅显示有净流入的LOF基金）\n")
+
+    # ── 成交额 TOP（二级市场最活跃）
+    top_amt = flow.get("top_by_amount", [])
+    if top_amt:
+        print("  🔥 今日成交额 TOP 10（二级市场最活跃）")
+        print("  " + "-" * 60)
+        for i, e in enumerate(top_amt, 1):
+            code   = str(e.get("代码", ""))
+            name   = str(e.get("名称", ""))[:12]
+            pct    = e.get("涨跌幅")
+            amt    = e.get("成交额")
+            pct_s  = f"{pct:+.2f}%" if pct is not None else "N/A"
+            amt_s  = _fmt_amount(amt) if amt else "N/A"
+            print(f"  {i:2d}. [{code}]{name:<12}  {pct_s:<8}  成交额: {amt_s}")
+        print()
+
+
+# ──────────────────────────────────────────────
 # 输出格式化
 # ──────────────────────────────────────────────
 
@@ -866,7 +1591,7 @@ def main():
     parser = argparse.ArgumentParser(description="ETF 行情扫描与分析工具")
     parser.add_argument(
         "--mode",
-        choices=["rank", "momentum", "oversold", "core", "portfolio", "valuation"],
+        choices=["rank", "momentum", "oversold", "core", "portfolio", "valuation", "share_flow", "market_flow"],
         help="单项分析模式"
     )
     parser.add_argument("--json", action="store_true", help="JSON 格式输出")
@@ -935,6 +1660,22 @@ def main():
         output["valuation"] = val_list
         if not args.json:
             print_valuation(val_list)
+
+    # ── 持仓份额变化（一级市场申购/赎回信号）
+    if args.mode == "share_flow":
+        print("⏳ 正在获取持仓ETF份额数据...", file=sys.stderr)
+        share_flow = get_portfolio_share_flow()
+        output["share_flow"] = share_flow
+        if not args.json:
+            print_portfolio_share_flow(share_flow)
+
+    # ── 全市场资金流向
+    if args.mode == "market_flow":
+        print("⏳ 正在获取全市场ETF资金流向（东财实时数据）...", file=sys.stderr)
+        market_flow = get_market_etf_flow()
+        output["market_flow"] = market_flow
+        if not args.json:
+            print_market_etf_flow(market_flow)
 
     # ── 汇总摘要（全量模式）
     if show_all and not args.json:
