@@ -936,8 +936,9 @@ def _try_akshare_flow(top_n: int = 10) -> Dict:
             return {"success": False, "error": "AkShare 返回空数据"}
         
         # 动态检测列名（兼容不同版本）
-        flow_col_options = ["主力净流入净额", "净流入", "主力净流入", "净额"]
-        flow_pct_col_options = ["主力净流入净占比", "净流入占比", "净占比"]
+        # ✅ AkShare实际返回的列名包含连字符（如"主力净流入-净额"）
+        flow_col_options = ["主力净流入-净额", "主力净流入净额", "净流入", "主力净流入", "净额"]
+        flow_pct_col_options = ["主力净流入-净占比", "主力净流入净占比", "净流入占比", "净占比"]
         share_col_options = ["最新份额", "基金份额", "份额", "总份额"]
         mktval_col_options = ["流通市值", "基金市值", "市值", "总市值"]
         price_col_options = ["最新价", "收盘价", "现价", "价格"]
@@ -1367,9 +1368,9 @@ def print_market_etf_flow(flow: Dict):
         for i, e in enumerate(top_in, 1):
             code = str(e.get("代码", ""))
             name = str(e.get("名称", ""))[:12]
-            price = e.get("最新价")
             pct   = e.get("涨跌幅")
-            inflow = e.get("主力净流入净额")
+            # ✅ 兼容两种字段名（带连字符和不带连字符）
+            inflow = e.get("主力净流入-净额") or e.get("主力净流入净额")
             pct_s  = f"{pct:+.2f}%" if pct is not None else "N/A"
             flow_s = _fmt_amount(inflow) if inflow else "N/A"
             print(f"  {i:2d}. [{code}]{name:<12}  {pct_s:<8}  净流入: {flow_s}")
@@ -1384,7 +1385,8 @@ def print_market_etf_flow(flow: Dict):
             code = str(e.get("代码", ""))
             name = str(e.get("名称", ""))[:12]
             pct   = e.get("涨跌幅")
-            outflow = e.get("主力净流入净额")
+            # ✅ 兼容两种字段名（带连字符和不带连字符）
+            outflow = e.get("主力净流入-净额") or e.get("主力净流入净额")
             pct_s  = f"{pct:+.2f}%" if pct is not None else "N/A"
             flow_s = _fmt_amount(abs(outflow)) if outflow and outflow < 0 else "N/A"
             print(f"  {i:2d}. [{code}]{name:<12}  {pct_s:<8}  净流出: {flow_s}")
